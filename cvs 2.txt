@@ -1,0 +1,100 @@
+import requests
+import sqlite3
+from datetime import datetime, timedelta
+
+# Define database connection
+conn = sqlite3.connect("vulnerabilities.db")
+cursor = conn.cursor()
+
+# Create table if not exists
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS vulnerabilities (
+        id TEXT PRIMARY KEY,
+        description TEXT,
+        cvss_score REAL,
+        severity TEXT
+    )
+""")
+
+# Function to fetch CVEs from the last 7 days
+def fetch_cve_data():
+    # Set date range to the last week
+    end_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    start_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    
+    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?pubStartDate={start_date}&pubEndDate={end_date}"
+    response = requests.get(url)
+    
+    if response.status_code == 200:
+        return response.json().get("vulnerabilities", [])
+    return []
+
+# Function to classify vulnerability severity
+def classify_severity(cvss_score):
+    if cvss_score >= 9.0:
+        return "Critical"
+    elif cvss_score >= 7.0:
+        return "High"
+    elif cvss_score >= 4.0:
+        return "Medium"
+    else:
+        return "Low"
+
+# Function to process and store vulnerabilities
+def process_and_store_vulnerabilities():
+    vulnerabilities = fetch_cve_data()
+    count = 0  # Limit output to 3 vulnerabilities
+    
+    for vuln in vulnerabilities:
+        cve = vuln.get("cve", {})
+        cve_id = cve.get("id", "Unknown ID")
+        descriptions = cve.get("descriptions", [])
+        
+        # Extract description (prefer English)
+        description = "No description available"
+        for desc in descriptions:
+            if desc.get("lang") == "en":
+                description = desc.get("value", description)
+
+        # Extract CVSS score (checking v3.1, v3.0, and v2)
+        cvss_score = None
+        metrics = cve.get("metrics", {})
+        if "cvssMetricV31" in metrics:
+            cvss_score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
+        elif "cvssMetricV30" in metrics:
+            cvss_score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
+        elif "cvssMetricV2" in metrics:
+            cvss_score = metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
+        
+        # Skip CVEs without a CVSS score
+        if cvss_score is None:
+            continue
+        
+        severity = classify_severity(cvss_score)
+
+        # Store in database
+        cursor.execute("INSERT OR IGNORE INTO vulnerabilities VALUES (?, ?, ?, ?)", 
+                       (cve_id, description, cvss_score, severity))
+        conn.commit()
+
+        count += 1
+        if count >= 3:  # Store only 3 CVEs for output
+            break
+
+# Run the process
+process_and_store_vulnerabilities()
+
+# Reconnect to database to fetch stored data (Limit to 3 results)
+cursor.execute("SELECT * FROM vulnerabilities LIMIT 3")
+rows = cursor.fetchall()
+
+# Check if data exists
+if rows:
+    print("\nStored Vulnerabilities (Limited to 3 entries from last week):")
+    for row in rows:
+        print(f"ID: {row[0]}, Description: {row[1]}, CVSS Score: {row[2]}, Severity: {row[3]}")
+else:
+    print("No valid data found in the database.")
+
+# Close connection
+conn.close()
